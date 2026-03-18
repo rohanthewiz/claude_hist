@@ -132,7 +132,7 @@ func serveWeb(projectDir, displayDir, addr string) error {
 			return ctx.SetStatus(500).WriteHTML(renderErrorPage("Failed to load session"))
 		}
 
-		return ctx.WriteHTML(renderSessionPage(id, found.timestamp, responses))
+		return ctx.WriteHTML(renderSessionPage(id, found.timestamp, responses, sessions))
 	})
 
 	log.Fatal(s.Run())
