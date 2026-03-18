@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/rohanthewiz/logger"
+	"github.com/rohanthewiz/rweb"
+	"github.com/rohanthewiz/serr"
 )
 
 func main() {
@@ -19,16 +23,13 @@ func main() {
 }
 
 func run(args []string) error {
-	var projectDir string
-	var err error
-
-	// Check for --dir flag
 	var dirArg string
 	if len(args) >= 2 && args[0] == "--dir" {
 		dirArg = args[1]
 		args = args[2:]
 	}
-	projectDir, err = resolveProjectDir(dirArg)
+
+	projectDir, err := resolveProjectDir(dirArg)
 	if err != nil {
 		return err
 	}
@@ -42,11 +43,20 @@ func run(args []string) error {
 		return listSessions(projectDir)
 	case "--all":
 		return extractAll(projectDir)
+	case "--web":
+		addr := ":7070"
+		if len(args) >= 2 {
+			addr = args[1]
+		}
+		displayDir := dirArg
+		if displayDir == "" {
+			displayDir, _ = os.Getwd()
+		}
+		return serveWeb(projectDir, displayDir, addr)
 	case "--help", "-h":
 		printUsage()
 		return nil
 	default:
-		// Check if arg is a number referring to a session index
 		if n, err := strconv.Atoi(args[0]); err == nil && n >= 1 && n <= 999 {
 			return extractByIndex(projectDir, n)
 		}
@@ -60,117 +70,77 @@ func printUsage() {
 Extract Claude Code's text responses from conversation history.
 
 Options:
-  (none)          Show responses from the latest session
-  <1-999>         Show responses for session at that index (see --list)
-  --dir <path>    Use the given project path instead of the current directory
-  --list          List available sessions with numeric indices
-  --all           Show responses from all sessions
-  --help, -h      Show this help
+  (none)              Show responses from the latest session
+  <1-999>             Show responses for session at that index (see --list)
+  --dir <path>        Use the given project path instead of the current directory
+  --list              List available sessions with numeric indices
+  --all               Show responses from all sessions
+  --web [addr]        Start web UI (default addr: :7070)
+  --help, -h          Show this help
 
 Output goes to stdout — pipe to a file as needed:
   claude_hist > responses.md`)
 }
 
-// resolveProjectDir converts a project path to its Claude Code project directory.
-// If path is empty, the current working directory is used.
-func resolveProjectDir(path string) (string, error) {
-	if path == "" {
-		var err error
-		path, err = os.Getwd()
-		if err != nil {
-			return "", fmt.Errorf("getting working directory: %w", err)
-		}
-	}
-
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("resolving path: %w", err)
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("getting home directory: %w", err)
-	}
-
-	// Claude Code uses the absolute path with "/" replaced by "-", minus the leading "-"
-	key := strings.ReplaceAll(absPath, "/", "-")
-	key = strings.TrimPrefix(key, "-")
-
-	dir := filepath.Join(home, ".claude", "projects", "-"+key)
-	if _, err := os.Stat(dir); err == nil {
-		return dir, nil
-	}
-
-	// Fallback: also try with "_" converted to "-"
-	altKey := strings.ReplaceAll(key, "_", "-")
-	if altKey != key {
-		altDir := filepath.Join(home, ".claude", "projects", "-"+altKey)
-		if _, err := os.Stat(altDir); err == nil {
-			return altDir, nil
-		}
-	}
-
-	return "", fmt.Errorf("no Claude Code project found for %s, dir: %s", absPath, dir)
-}
-
-type sessionInfo struct {
-	id        string
-	path      string
-	timestamp string
-	modTime   int64
-}
-
-func getSessions(projectDir string) ([]sessionInfo, error) {
-	entries, err := os.ReadDir(projectDir)
-	if err != nil {
-		return nil, fmt.Errorf("reading project directory: %w", err)
-	}
-
-	var sessions []sessionInfo
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		s := sessionInfo{
-			id:      strings.TrimSuffix(e.Name(), ".jsonl"),
-			path:    filepath.Join(projectDir, e.Name()),
-			modTime: info.ModTime().UnixNano(),
-		}
-		s.timestamp = firstTimestamp(s.path)
-		sessions = append(sessions, s)
-	}
-
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].modTime > sessions[j].modTime
+func serveWeb(projectDir, displayDir, addr string) error {
+	logger.InitLog(logger.LogConfig{
+		Formatter: "text",
+		LogLevel:  "info",
 	})
-	return sessions, nil
-}
+	defer logger.CloseLog()
 
-func firstTimestamp(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return "unknown"
-	}
-	defer f.Close()
+	logger.Info("Starting Claude History server", "addr", addr, "project_dir", projectDir)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		var rec record
-		if json.Unmarshal(scanner.Bytes(), &rec) == nil && rec.Timestamp != "" {
-			return formatTimestamp(rec.Timestamp)
+	s := rweb.NewServer(rweb.ServerOptions{
+		Address: addr,
+		Verbose: true,
+	})
+	s.Use(rweb.RequestInfo)
+
+	s.Get("/", func(ctx rweb.Context) error {
+		sessions, err := getSessions(projectDir)
+		if err != nil {
+			logger.Err(serr.Wrap(err, "msg", "listing sessions"))
+			return ctx.SetStatus(500).WriteHTML(renderErrorPage("Failed to load sessions: " + err.Error()))
 		}
-	}
-	return "unknown"
+		return ctx.WriteHTML(renderSessionsPage(sessions, displayDir))
+	})
+
+	s.Get("/session/:id", func(ctx rweb.Context) error {
+		id := ctx.Request().PathParam("id")
+
+		sessions, err := getSessions(projectDir)
+		if err != nil {
+			logger.Err(serr.Wrap(err, "msg", "loading sessions for detail", "id", id))
+			return ctx.SetStatus(500).WriteHTML(renderErrorPage("Failed to load sessions"))
+		}
+
+		var found *sessionInfo
+		for i := range sessions {
+			if sessions[i].id == id {
+				found = &sessions[i]
+				break
+			}
+		}
+		if found == nil {
+			return ctx.SetStatus(404).WriteHTML(renderErrorPage("Session not found: " + id))
+		}
+
+		responses, err := getResponses(found.path)
+		if err != nil {
+			logger.Err(serr.Wrap(err, "msg", "loading responses", "id", id))
+			return ctx.SetStatus(500).WriteHTML(renderErrorPage("Failed to load session"))
+		}
+
+		return ctx.WriteHTML(renderSessionPage(id, found.timestamp, responses))
+	})
+
+	log.Fatal(s.Run())
+	return nil
 }
 
 func listSessions(projectDir string) error {
 	fmt.Printf("Sessions for %s:\n", projectDir)
-
 	sessions, err := getSessions(projectDir)
 	if err != nil {
 		return err
@@ -233,21 +203,6 @@ func extractSession(projectDir, sessionID string) error {
 	return extractResponses(path)
 }
 
-type contentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type message struct {
-	Content []contentBlock `json:"content"`
-}
-
-type record struct {
-	Type      string  `json:"type"`
-	Timestamp string  `json:"timestamp"`
-	Message   message `json:"message"`
-}
-
 func extractResponses(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -291,11 +246,4 @@ func extractResponses(path string) error {
 		}
 	}
 	return scanner.Err()
-}
-
-func formatTimestamp(ts string) string {
-	if len(ts) >= 19 {
-		return strings.Replace(ts[:19], "T", " ", 1)
-	}
-	return ts
 }

@@ -1,0 +1,8 @@
+.claude
+.idea/
+.vscode
+.zed
+.DS_Store
+
+cchist
+claude_hist
